@@ -1,0 +1,161 @@
+# AGENTS.md
+
+> 本文件规定仓库内所有 AI 编程助手应遵守的通用约定。`apps/` 下的独立项目可以另设 `AGENTS.md`；在各自目录内，优先遵循更具体的规则。
+> 运行时专用配置应放在对应工具的配置文件中（例如 Claude 读取 `CLAUDE.md`），不要混入本文件。
+
+## 项目概况
+
+**MemOS / MemoryOS**：面向大语言模型 Agent 的记忆操作系统，包含 Python 库与 FastAPI 服务，支持文本、树状、偏好、技能、KV 缓存和 LoRA 参数化等记忆类型，以及记忆调度、版本管理、向量存储和图存储。
+
+- **代码仓库**：https://github.com/MemTensor/MemOS
+- **项目文档**：https://memos-docs.openmem.net/home/overview/
+- **PyPI 包**：https://pypi.org/project/MemoryOS/
+- **许可证**：Apache-2.0
+- **顶层包目录**：`src/memos/`；发布名称为 `MemoryOS`，导入名称为 `memos`。
+- **命令行入口**：`memos`（`memos.cli:main`）
+- **API 服务入口**：`memos.api.start_api:app`
+
+## 仓库结构
+
+| 路径 | 用途 |
+|------|------|
+| `src/memos/mem_os/` | `MOS` / `MOSCore`，记忆操作系统顶层入口 |
+| `src/memos/mem_cube/` | `GeneralMemCube`，聚合多种记忆类型的容器 |
+| `src/memos/memories/` | 记忆实现：`textual/`、`activation/`、`parametric/` |
+| `src/memos/mem_scheduler/` | 记忆调度器、监控、ORM 和任务调度 |
+| `src/memos/mem_user/` | 用户与多租户管理（MySQL / Redis 后端） |
+| `src/memos/mem_chat/` `mem_reader/` `mem_agent/` `mem_feedback/` `multi_mem_cube/` | 聊天会话、数据摄入、Agent 集成、反馈、多个记忆容器的路由 |
+| `src/memos/llms/` `embedders/` `vec_dbs/` `graph_dbs/` `chunkers/` `parsers/` `reranker/` | 各类服务提供者的实现（`base.py`、`factory.py` 和具体后端） |
+| `src/memos/api/` | FastAPI 服务（路由、处理器、中间件、MCP 服务） |
+| `src/memos/configs/` | 各模块对应的 Pydantic 配置类 |
+| `src/memos/context/` | 跨线程上下文（trace_id、用户、运行环境） |
+| `tests/` | pytest 测试，子目录与 `src/memos/` 对应 |
+| `apps/` | 独立子项目，各自有说明文档，不属于主项目的统一构建流程 |
+| `extensions/` | 官方插件示例 |
+| `docker/` `docs/` `evaluation/` `scripts/` | 部署、文档、评估及辅助脚本 |
+| `.claude/agents/`、`.codex/agents/` | 项目推荐的 AI 子 Agent 定义 |
+
+## 常用命令
+
+以下命令适用于仓库中的 **Python 主项目**；`apps/` 下的独立项目使用各自的工具链与约定。
+
+- **安装依赖**：`make install`（包括 `poetry install --extras all --with dev --with test`、pre-commit 和推送钩子）
+- **启动 API**：`make serve`
+- **导出 OpenAPI**：`make openapi`（写入 `docs/openapi.json`）
+- **运行全量测试**：`make test`
+- **运行单个测试**：`poetry run pytest tests/<path>/test_xxx.py -q`
+- **检查和格式化代码**：`make format`
+- **运行完整提交前检查**：`make pre_commit`
+- **构建发布包**：`poetry build`（GitHub 发布时由 `python-release.yml` 自动处理发布）
+
+## 核心 API
+
+### Python 顶层导入（`from memos import ...`）
+
+| 符号 | 用途 | 来源 |
+|------|------|------|
+| `MOS` | 记忆操作系统顶层入口，继承 `MOSCore` | `memos.mem_os.main` |
+| `GeneralMemCube` | 通用记忆容器 | `memos.mem_cube.general` |
+| `MOSConfig` / `GeneralMemCubeConfig` | 主要配置类 | `memos.configs.mem_os` / `memos.configs.mem_cube` |
+| `GeneralScheduler` / `SchedulerFactory` / `SchedulerConfigFactory` | 调度器及工厂 | `memos.mem_scheduler.*` |
+
+`MOS` 常用方法：`MOS.simple()`（从环境自动配置）、`register_mem_cube(cube)`、`add(...)`、`search(...)`、`chat(...)`、`create_user(...)` / `list_users()`。
+
+### API 入口
+
+- **ASGI 应用**：`memos.api.start_api:app`
+- **路由目录**：`src/memos/api/routers/`（`admin_router`、`product_router`、`server_router`）
+- **OpenAPI 契约文件**：`docs/openapi.json`；修改 API 后必须执行 `make openapi`。
+
+## 导入规范
+
+| 用途 | 导入方式 |
+|------|----------|
+| 顶层入口 | `from memos import MOS, GeneralMemCube, MOSConfig` |
+| 配置类 | `from memos.configs.<submodule> import <Config>` |
+| 服务提供者工厂 | `from memos.<category>.factory import <Category>Factory` |
+| 日志 | `from memos.log import get_logger`；`logger = get_logger(__name__)` |
+| 上下文与追踪 | `from memos.context.context import get_current_trace_id, get_current_user_name` |
+| 异常 | `from memos.exceptions import <semantic Exception>` |
+
+## 服务提供者列表
+
+各类服务提供者采用相同的三部分结构：`base.py` 抽象基类、`factory.py` 注册表、`configs/<category>.py` 配置类。实际已注册后端以相应工厂中的 `backend_to_class` 为准，下表仅供快速定位。
+
+| 类别 | 基类 | 工厂 | 已注册后端 |
+|------|------|------|------------|
+| 大语言模型 | `BaseLLM` | `LLMFactory` | `openai` / `openai_new` / `azure` / `ollama` / `huggingface` / `huggingface_singleton` / `vllm` / `qwen` / `deepseek` |
+| 向量嵌入 | `BaseEmbedder` | `EmbedderFactory` | `ollama` / `sentence_transformer` / `ark` / `universal_api` |
+| 向量数据库 | `BaseVecDB` | `VecDBFactory` | `qdrant` / `milvus` |
+| 图数据库 | `GraphStoreFactory` | `GraphStoreFactory` | `neo4j` / `neo4j_community` / `nebular` / `polardb` / `postgres` |
+| 文本切分 | `BaseChunker` | `ChunkerFactory` | `sentence` / `markdown` / `simple` / `charactertext` |
+| 文档解析 | `BaseParser` | `ParserFactory` | `markitdown` |
+| 重排序 | `BaseReranker` | `RerankerFactory` | `cosine_local` / `http_bge` / `http_bge_strategy` / `concat` / `noop` |
+| 记忆 | `BaseMemory`（另有 `BaseTextMemory` / `BaseActMemory` / `BaseParaMemory`） | `MemoryFactory` | `naive_text` / `general_text` / `tree_text` / `simple_tree_text` / `pref_text` / `kv_cache` / `vllm_kv_cache` / `lora` |
+| 调度器 | `BaseScheduler` | `SchedulerFactory` | `general` / `optimized` |
+
+## 新增服务提供者
+
+参考同一类别中现有服务提供者的实现方式：
+
+1. 新建 `src/memos/<category>/<backend>.py`，继承 `base.py` 中的抽象基类，并保持方法签名一致。
+2. 在 `src/memos/configs/<category>.py` 中添加 Pydantic 配置，并注册到 `<Category>ConfigFactory.backend_to_class`。
+3. 在 `src/memos/<category>/factory.py` 中注册到 `<Category>Factory.backend_to_class`。
+4. 第三方依赖**必须**加入 `pyproject.toml` 中对应的可选依赖组（`tree-mem` / `mem-scheduler` / `mem-user` / `mem-reader` / `pref-mem` / `skill-mem`），并纳入 `all`；通过 `try/except ImportError` 保护导入，缺少依赖时明确提示要安装的扩展组。
+5. 在 `tests/<category>/test_<backend>.py` 下添加测试；外部 HTTP 请求和模型加载应使用模拟对象。
+
+## 行为边界
+
+### 必须执行
+
+- 修改 Python 核心代码时，先在 `tests/<corresponding module>/test_*.py` 编写失败测试（测试驱动开发）；独立应用遵循自身测试目录规范。
+- 完成任务前必须运行相关验证命令，并如实报告输出（Python 主项目运行 `make format` 与 pytest；`apps/` 下运行应用自身的命令）。
+- 修改范围限于当前任务授权的目录；跨模块修改必须提前说明并获得确认。
+- Python 核心代码使用 `memos.log.get_logger(__name__)` 记录日志，通过 `memos.context.context` 传递追踪信息，不使用 `print`。
+- 对可选第三方依赖（如 neo4j、redis、pika、pymilvus、markitdown）使用 `try/except ImportError`，并声明在对应可选依赖组中。
+- 修改 `src/memos/api/` 后运行 `make openapi`，更新 `docs/openapi.json`。
+
+### 修改前须确认
+
+- 修改 `pyproject.toml` 中的依赖或 Python 版本约束。
+- 修改 `src/memos/api/` 下的公开路由、请求/响应模型或 OpenAPI 契约。
+- 修改数据库结构、迁移文件、`mem_user` 数据表或 `graph_dbs` 图模型。
+- 删除文件，或大范围重命名公开 API（`memos.*` 顶层符号）。
+- 修改 `Makefile`、`.pre-commit-config.yaml`、`pyproject.toml [tool.*]` 或 `.github/workflows/`。
+
+### 严格禁止
+
+- **不得提交** `.env`、`private/`、`.private-paths`、`tmp/`、`*.log`、密钥、令牌或模型凭据。
+- 不得在日志、测试或测试数据中包含真实 API 密钥、原始用户数据或向量内容。
+- 不得跳过 `pre-commit` 或使用 `--no-verify` 推送（项目执行 `scripts/check-public-push.sh` 推送前检查）。
+- 没有实际测试输出，不得声称测试通过（Python 主项目使用 pytest，独立应用使用各自的测试工具）。
+- 不得将第三方依赖直接加入核心 `dependencies`，应使用可选依赖组。
+- 不得在 `src/` 之外大范围执行 `rm -rf`，不得执行 `git push --force` 或 `git reset --hard origin/*`。
+
+## 代码风格
+
+以下规范仅适用于根目录 Python 主项目；独立应用遵循各自编程语言的规范。
+
+- 使用 Ruff 格式化和检查代码（配置在 `pyproject.toml [tool.ruff]`）；提交前必须通过 `make format`。
+- 公共函数、API 模型和配置类必须添加类型注解；提交前检查不允许隐式 `Optional`。
+- 配置与 API 数据模型使用 Pydantic v2。
+- 日志采用 `logger.info("... %s", x)`，不要先通过 f-string 拼接日志字符串。
+- 库代码应抛出 `memos.exceptions` 中的语义化异常，不要直接使用 `Exception` / `RuntimeError`；API 层通过 `memos.api.exceptions` 转换为 HTTP 错误。
+- 文件命名：源码采用 `snake_case.py`，测试采用 `test_<module>.py`。
+
+## 修改与测试对应关系
+
+以下规则适用于 Python 主项目；独立应用遵循各自的 `AGENTS.md` 和测试脚本。
+
+- 修改 `src/memos/<module>/`：至少运行 `pytest tests/<corresponding module>/ -q`；合并前再运行一次 `make test`。
+- 修改 `src/memos/api/`：运行 `tests/api/` 和 `make openapi`，确认 OpenAPI 契约未意外变化。
+- 修改 `pyproject.toml` 中的依赖：运行 `poetry lock --no-update`，再运行 `make test`。
+- 修改 `Makefile`、pre-commit 或 Ruff 配置：在本地对整个仓库运行 `make pre_commit`。
+
+## Git 约定
+
+- **提交信息**：采用 Conventional Commits（`feat:` / `fix:` / `chore:` / `refactor:` / `docs:`），标题不超过 72 个字符。
+- **分支命名**：`feat/<slug>` / `fix/<slug>` / `dev-YYYYMMDD-v<version>`。
+- **主分支保护**：`main` 受保护；所有变更通过拉取请求（PR）合入，不得强制推送到 `main`，不得跳过 Git 钩子。
+- 不得提交 `.private-paths` 中列出的路径。
+- 拉取请求模板位于 `.github/PULL_REQUEST_TEMPLATE.md`，需完成其中的检查清单。

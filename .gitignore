@@ -4,6 +4,7 @@
 # Temporary files
 tmp/
 **/tmp_data/
+docs/
 
 # evaluation data
 *.csv
