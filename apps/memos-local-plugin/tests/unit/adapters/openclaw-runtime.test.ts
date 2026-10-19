@@ -33,6 +33,7 @@ afterEach(() => {
   vi.doUnmock("../../../core/pipeline/index.js");
   vi.doUnmock("../../../server/http.js");
   vi.doUnmock("../../../core/telemetry/index.js");
+  vi.doUnmock("../../../core/llm/host-bridge.js");
   vi.doUnmock("../../../adapters/openclaw/bridge.js");
   vi.resetModules();
   vi.restoreAllMocks();
@@ -88,6 +89,7 @@ async function loadPluginWithMocks(
   bootstrapMemoryCoreFull: ReturnType<typeof vi.fn>,
   startHttpServer: ReturnType<typeof vi.fn>,
   createOpenClawBridge?: ReturnType<typeof vi.fn>,
+  unregisterHostLlmBridge?: ReturnType<typeof vi.fn>,
 ) {
   vi.resetModules();
   vi.doMock("../../../core/pipeline/index.js", () => ({
@@ -102,6 +104,11 @@ async function loadPluginWithMocks(
       shutdown = vi.fn(async () => {});
     },
   }));
+  if (unregisterHostLlmBridge) {
+    vi.doMock("../../../core/llm/host-bridge.js", () => ({
+      unregisterHostLlmBridge,
+    }));
+  }
   if (createOpenClawBridge) {
     vi.doMock("../../../adapters/openclaw/bridge.js", async () => {
       const actual = await vi.importActual<
@@ -175,6 +182,118 @@ describe("OpenClaw adapter runtime lifecycle", () => {
     const tool = factory({ agentId: "main" });
     if (!tool || Array.isArray(tool)) throw new Error("Expected a single tool");
     await expect(tool.execute("compat-test", { query: "test" })).rejects.toThrow("runtime is not ready");
+  });
+
+  it("keeps `openclaw plugins list` metadata-only without bootstrapping MemOS", async () => {
+    useTempMemosHome();
+    const boot = vi.fn();
+    const server = vi.fn();
+    const plugin = await loadPluginWithMocks(boot, server);
+    const api = makeApi();
+    const originalArgv = process.argv;
+    process.argv = ["node", "openclaw.mjs", "plugins", "list"];
+    try {
+      plugin.register(api);
+    } finally {
+      process.argv = originalArgv;
+    }
+
+    expect(boot).not.toHaveBeenCalled();
+    expect(server).not.toHaveBeenCalled();
+    expect(api.on).not.toHaveBeenCalled();
+    expect(api.services).toHaveLength(0);
+    expect(api.registerTool).toHaveBeenCalled();
+  });
+
+  it("keeps CLI metadata registration runtime-free", async () => {
+    useTempMemosHome();
+    const boot = vi.fn();
+    const server = vi.fn();
+    const plugin = await loadPluginWithMocks(boot, server);
+    const api = Object.assign(makeApi(), { registrationMode: "cli-metadata" as const });
+
+    plugin.register(api);
+
+    expect(boot).not.toHaveBeenCalled();
+    expect(server).not.toHaveBeenCalled();
+    expect(api.on).not.toHaveBeenCalled();
+    expect(api.services).toHaveLength(0);
+    expect(api.registerTool).toHaveBeenCalled();
+  });
+
+  it("registers the host LLM bridge with core bootstrap", async () => {
+    const home = useTempMemosHome();
+    const core = makeCore();
+    const bootstrapMemoryCoreFull = vi.fn(async () => ({ core, config: DEFAULT_CONFIG, home }));
+    const startHttpServer = vi.fn(async () => ({
+      url: "http://127.0.0.1:18799",
+      port: 18799,
+      closed: false,
+      close: vi.fn(async () => {}),
+    }));
+    const plugin = await loadPluginWithMocks(bootstrapMemoryCoreFull, startHttpServer);
+    const complete = vi.fn(async () => ({
+      text: "host response",
+      provider: "openai",
+      model: "configured-model",
+      usage: { inputTokens: 3, outputTokens: 2, totalTokens: 5 },
+    }));
+    const api = Object.assign(makeApi(), { runtime: { llm: { complete } } });
+
+    plugin.register(api);
+    await api.services[0]!.start?.();
+    try {
+      const options = bootstrapMemoryCoreFull.mock.calls[0]?.[0];
+      const hostLlmBridge = options?.hostLlmBridge;
+      expect(hostLlmBridge).toMatchObject({ id: "openclaw.host.v1" });
+      await expect(hostLlmBridge.complete({
+        messages: [{ role: "user", content: "memory work" }],
+      })).resolves.toMatchObject({
+        text: "host response",
+        model: "configured-model",
+        usage: { promptTokens: 3, completionTokens: 2, totalTokens: 5 },
+      });
+      expect(complete).toHaveBeenCalledWith({
+        messages: [{ role: "user", content: "memory work" }],
+        purpose: "memos-local-memory",
+      });
+    } finally {
+      await api.services[0]!.stop?.();
+    }
+  });
+
+  it("releases only its own host LLM bridge when the runtime stops", async () => {
+    const home = useTempMemosHome();
+    const core = makeCore();
+    const bootstrapMemoryCoreFull = vi.fn(async () => ({ core, config: DEFAULT_CONFIG, home }));
+    const startHttpServer = vi.fn(async () => ({
+      url: "http://127.0.0.1:18799",
+      port: 18799,
+      closed: false,
+      close: vi.fn(async () => {}),
+    }));
+    const unregisterHostLlmBridge = vi.fn();
+    const plugin = await loadPluginWithMocks(
+      bootstrapMemoryCoreFull,
+      startHttpServer,
+      undefined,
+      unregisterHostLlmBridge,
+    );
+    const complete = vi.fn(async () => ({
+      text: "host response",
+      provider: "openai",
+      model: "configured-model",
+      usage: {},
+    }));
+    const api = Object.assign(makeApi(), { runtime: { llm: { complete } } });
+
+    plugin.register(api);
+    await api.services[0]!.start?.();
+    const registeredBridge = bootstrapMemoryCoreFull.mock.calls[0]?.[0]?.hostLlmBridge;
+    await api.services[0]!.stop?.();
+
+    expect(unregisterHostLlmBridge).toHaveBeenCalledOnce();
+    expect(unregisterHostLlmBridge).toHaveBeenLastCalledWith(registeredBridge);
   });
 
   it("reuses the runtime and registers conversation hooks in another host registry", async () => {
@@ -482,7 +601,7 @@ describe("OpenClaw hook listener contract (issue #1815)", () => {
     await api.services[0]!.stop?.();
   });
 
-  it("agent_end listener returns synchronously and dispatches the bridge work as fire-and-forget", async () => {
+  it("agent_end listener remains void-shaped so a host LLM call cannot deadlock the gateway", async () => {
     let releaseAgentEnd: (() => void) | null = null;
     const agentEndStarted = vi.fn();
     const bridge = buildBridgeStub();
@@ -506,32 +625,26 @@ describe("OpenClaw hook listener contract (issue #1815)", () => {
       | undefined;
     expect(handler).toBeDefined();
 
-    const beforeReturn = Date.now();
     const ret = handler!(
       { messages: [], success: true, durationMs: 10 },
       { agentId: "main", sessionKey: "s-1", runId: "run-1" },
     );
-    const afterReturn = Date.now();
 
-    // OpenClaw's contract: the listener must return void / undefined,
-    // NOT a Promise that the runner would await against the 30 s
-    // hard-coded budget.
     expect(ret).toBeUndefined();
-    expect(afterReturn - beforeReturn).toBeLessThan(50);
-
-    // The bridge work, however, MUST eventually run — fire-and-forget,
-    // not fire-and-drop.
     await vi.waitFor(() => {
       expect(bridge.handleAgentEnd).toHaveBeenCalledTimes(1);
     });
     expect(agentEndStarted).toHaveBeenCalledTimes(1);
 
-    // Release the background work so afterEach can shut down cleanly.
+    // Release terminal capture after the void listener has dispatched it.
     releaseAgentEnd?.();
+    await vi.waitFor(() => {
+      expect(bridge.handleAgentEnd).toHaveBeenCalledTimes(1);
+    });
     await api.services[0]!.stop?.();
   });
 
-  it("agent_end listener swallows background errors via opts.log.warn instead of surfacing them to OpenClaw", async () => {
+  it("agent_end listener swallows an asynchronous bridge terminal error", async () => {
     const bridge = buildBridgeStub();
     bridge.handleAgentEnd = vi.fn(async () => {
       throw new Error("boom inside onTurnEnd");
@@ -548,24 +661,26 @@ describe("OpenClaw hook listener contract (issue #1815)", () => {
       | OpenClawHookHandlerMap["agent_end"]
       | undefined;
     expect(handler).toBeDefined();
-    expect(() =>
-      handler!(
-        { messages: [], success: true },
-        { agentId: "main", sessionKey: "s-1", runId: "run-1" },
-      ),
-    ).not.toThrow();
+    expect(handler!(
+      { messages: [], success: true },
+      { agentId: "main", sessionKey: "s-1", runId: "run-1" },
+    )).toBeUndefined();
 
     await vi.waitFor(() => {
+      expect(api.logger.warn).toHaveBeenCalled();
+    });
+
+    expect(() => {
       expect(api.logger.warn).toHaveBeenCalledWith(
         expect.stringContaining("hook agent_end failed"),
         expect.objectContaining({ err: expect.stringContaining("boom inside onTurnEnd") }),
       );
-    });
+    }).not.toThrow();
 
     await api.services[0]!.stop?.();
   });
 
-  it("every void hook listener (agent_end / session_* / *_tool_call / subagent_*) is registered as a non-async function", async () => {
+  it("only before_prompt_build is async; lifecycle hooks remain void-shaped", async () => {
     const bridge = buildBridgeStub();
     const plugin = (await buildPluginWithFakeBridge({ bridge })) as {
       register: (api: OpenClawPluginApi) => void;
@@ -574,8 +689,7 @@ describe("OpenClaw hook listener contract (issue #1815)", () => {
     plugin.register(api);
     await api.services[0]!.start?.();
 
-    // before_prompt_build is value-returning and the only listener
-    // allowed to be async (OpenClaw awaits its prependContext).
+    // before_prompt_build injects context. All lifecycle hooks stay non-blocking.
     const voidHooks: OpenClawHookName[] = [
       "message_received",
       "agent_end",

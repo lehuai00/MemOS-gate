@@ -34,6 +34,7 @@ import {
   type BridgeHandle,
   type OpenClawInboundTextStore,
 } from "./bridge.js";
+import { createOpenClawHostLlmBridge } from "./host-llm.js";
 import {
   acquireOpenClawRuntimeLock,
   DuplicateOpenClawRuntimeError,
@@ -47,6 +48,10 @@ import type {
 } from "./openclaw-api.js";
 
 import { bootstrapMemoryCoreFull } from "../../core/pipeline/index.js";
+import {
+  unregisterHostLlmBridge,
+  type HostLlmBridge,
+} from "../../core/llm/host-bridge.js";
 import { resolveHome } from "../../core/config/index.js";
 import { rootLogger, memoryBuffer } from "../../core/logger/index.js";
 import type { MemoryCore } from "../../agent-contract/memory-core.js";
@@ -147,14 +152,21 @@ async function createRuntime(
 
   let core: MemoryCore | null = null;
   let viewer: ServerHandle | null = null;
+  let hostLlmBridge: HostLlmBridge | null = null;
 
   try {
     // Bootstrap core — returns `{ core, home, config }` so we know which
     // viewer port to bind.
+    hostLlmBridge = api.runtime?.llm
+      ? createOpenClawHostLlmBridge(api.runtime.llm)
+      : null;
     const boot = await bootstrapMemoryCoreFull({
       agent: "openclaw",
       namespace: { agentKind: "openclaw", profileId: "main" },
       pkgVersion: PLUGIN_VERSION,
+      // The host runtime resolves the configured agent model and credential;
+      // MemOS receives only a text-completion capability, never credentials.
+      hostLlmBridge,
     });
     core = boot.core;
     const { config, home } = boot;
@@ -234,6 +246,7 @@ async function createRuntime(
 
     const runtimeCore = core;
     const runtimeViewer = viewer;
+    const runtimeHostLlmBridge = hostLlmBridge;
     return {
       core: runtimeCore,
       bridge,
@@ -249,13 +262,19 @@ async function createRuntime(
           }
         }
         try {
-          await runtimeCore.shutdown();
-        } catch (err) {
-          api.logger.warn("memos-local: shutdown error", {
-            err: err instanceof Error ? err.message : String(err),
-          });
+          try {
+            await runtimeCore.shutdown();
+          } catch (err) {
+            api.logger.warn("memos-local: shutdown error", {
+              err: err instanceof Error ? err.message : String(err),
+            });
+          }
+        } finally {
+          if (runtimeHostLlmBridge) {
+            unregisterHostLlmBridge(runtimeHostLlmBridge);
+          }
+          runtimeLock.release();
         }
-        runtimeLock.release();
       },
     };
   } catch (err) {
@@ -267,6 +286,7 @@ async function createRuntime(
         /* best-effort cleanup after failed bootstrap */
       }
     }
+    if (hostLlmBridge) unregisterHostLlmBridge(hostLlmBridge);
     runtimeLock.release();
     throw err;
   }
@@ -286,28 +306,52 @@ async function closeViewerAfterFailedBootstrap(
 // ─── Registration ──────────────────────────────────────────────────────────
 
 /**
- * Detect if running in diagnostic mode (e.g., `openclaw doctor`).
- *
- * Diagnostic processes should skip runtime lock acquisition to avoid
- * false positive DuplicateOpenClawRuntimeError when the gateway is running.
+ * Detect CLI inspection commands that load plugin entries only to collect
+ * metadata. They must never hydrate MemOS: doing so opens SQLite and binds
+ * the viewer port in a short-lived control-plane process.
  */
 function isDiagnosticMode(): boolean {
-  // Check for OPENCLAW_DIAGNOSTIC_MODE environment variable
   if (process.env.OPENCLAW_DIAGNOSTIC_MODE === "1" ||
       process.env.OPENCLAW_DIAGNOSTIC_MODE === "true") {
     return true;
   }
 
-  // Check if process title or argv contains "doctor"
-  if (process.title?.includes("doctor")) {
+  if (process.title?.toLowerCase().includes("doctor")) {
     return true;
   }
 
-  if (process.argv.some(arg => arg.includes("doctor"))) {
-    return true;
+  const args = process.argv.slice(1).map((arg) => arg.toLowerCase());
+  if (args.includes("doctor")) return true;
+
+  // `openclaw plugins list` / `inspect` load installed entries in the CLI
+  // process. Match the command position rather than arbitrary path text.
+  for (const command of ["plugins", "plugin"]) {
+    const index = args.lastIndexOf(command);
+    if (index >= 0 && ["list", "inspect", "info", "status"].includes(args[index + 1] ?? "")) {
+      return true;
+    }
   }
 
   return false;
+}
+
+function isRuntimeFreeRegistrationMode(
+  mode: OpenClawPluginApi["registrationMode"],
+): boolean {
+  return mode === "discovery" || mode === "tool-discovery" ||
+    mode === "setup-only" || mode === "cli-metadata";
+}
+
+/** Register only tool descriptors; execution remains unavailable without a runtime. */
+function registerToolMetadata(
+  api: OpenClawPluginApi,
+  home: ReturnType<typeof resolveHome>,
+): void {
+  registerOpenClawTools(api, {
+    agent: "openclaw",
+    getCore: async () => (await activeRuntimes.get(home.root)?.ensureRuntime())?.core ?? null,
+    log: api.logger,
+  });
 }
 
 function registerRuntimeBindings(
@@ -413,18 +457,12 @@ function registerRuntimeBindings(
   //       bootstrap hasn't completed yet, the hook is a no-op (matches
   //       the legacy adapter — runtime not ready means no hint to
   //       inject).
-  //   (b) `agent_end` (and the other void hooks below) are run by
-  //       OpenClaw with a **hard-coded 30 s timeout**
-  //       (`DEFAULT_VOID_HOOK_TIMEOUT_MS_BY_HOOK.agent_end = 30_000`).
-  //       memos's onTurnEnd chain writes SQLite traces + runs L2
-  //       induction + reflection + reward (LLM-bound), which under I/O
-  //       pressure can exceed 30 s. Awaiting that chain inside the hook
-  //       handler shows up in the gateway log as
-  //       `agent_end handler … timed out after 30000ms`. We schedule
-  //       the heavy work as a **fire-and-forget** background task and
-  //       return immediately. `core.shutdown()` (called from the
-  //       service's `stop`) already drains in-flight pipeline work, so
-  //       fire-and-forget does not lose data on a clean shutdown.
+  //   (b) `agent_end` has a 30 s host budget. It remains void-shaped: the
+  //       host runs this lifecycle callback on the active agent execution
+  //       path, so awaiting a HostLlmBridge request here can deadlock the
+  //       Gateway. Terminal capture is therefore scheduled after the hook
+  //       returns. Host LLM work that needs live caller authority must be
+  //       performed in a value-returning hook instead of this callback.
   //
   // `before_prompt_build` stays async-await because it MUST return the
   // `prependContext` for OpenClaw to inject — it is a value-returning
@@ -445,10 +483,6 @@ function registerRuntimeBindings(
   });
 
   api.on("agent_end", (event, ctx) => {
-    // Fire-and-forget. Returning synchronously lets OpenClaw's 30s
-    // void-hook budget tick down only on its own bookkeeping; memos
-    // continues writing the trace + running the reflect/reward chain
-    // in the background.
     void runWhenReady((r) => r.bridge.handleAgentEnd(event, ctx), "agent_end");
   });
 
@@ -512,12 +546,8 @@ const activeRuntimes = processState[runtimeKey] ??= new Map<string, SharedRuntim
 
 function register(api: OpenClawPluginApi): void {
   const home = resolveHome("openclaw");
-  if (api.registrationMode === "tool-discovery") {
-    registerOpenClawTools(api, {
-      agent: "openclaw",
-      getCore: async () => (await activeRuntimes.get(home.root)?.ensureRuntime())?.core ?? null,
-      log: api.logger,
-    });
+  if (isRuntimeFreeRegistrationMode(api.registrationMode) || isDiagnosticMode()) {
+    registerToolMetadata(api, home);
     return;
   }
   const existing = activeRuntimes.get(home.root);
@@ -526,8 +556,6 @@ function register(api: OpenClawPluginApi): void {
     api.logger.info("memos-local: reused active runtime for host registry");
     return;
   }
-  const diagnosticMode = isDiagnosticMode();
-
   let runtimeLock: OpenClawRuntimeLockHandle;
   try {
     runtimeLock = acquireOpenClawRuntimeLock({
@@ -535,12 +563,8 @@ function register(api: OpenClawPluginApi): void {
       pluginId: PLUGIN_ID,
       version: PLUGIN_VERSION,
       viewerPort: OPENCLAW_VIEWER_PORT,
-      skipLock: diagnosticMode,
+      skipLock: false,
     });
-
-    if (diagnosticMode) {
-      api.logger.info("memos-local: running in diagnostic mode (lock acquisition skipped)");
-    }
   } catch (err) {
     const duplicate = err instanceof DuplicateOpenClawRuntimeError;
     api.logger.error("memos-local: duplicate OpenClaw runtime blocked", {

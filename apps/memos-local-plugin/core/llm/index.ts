@@ -13,6 +13,7 @@ export {
 } from "./json-mode.js";
 export {
   registerHostLlmBridge,
+  unregisterHostLlmBridge,
   getHostLlmBridge,
   __resetHostLlmBridgeForTests,
   type HostLlmBridge,

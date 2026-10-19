@@ -42,6 +42,19 @@ export function registerHostLlmBridge(bridge: HostLlmBridge | null): void {
   currentBridge = bridge;
 }
 
+/**
+ * Clear a bridge only when the caller still owns the current registration.
+ *
+ * Hosts may stop an older plugin runtime after a newer runtime has already
+ * registered its bridge. Identity matching prevents that stale shutdown from
+ * disconnecting the newer runtime's LLM capability.
+ */
+export function unregisterHostLlmBridge(bridge: HostLlmBridge): boolean {
+  if (currentBridge !== bridge) return false;
+  currentBridge = null;
+  return true;
+}
+
 export function getHostLlmBridge(): HostLlmBridge | null {
   return currentBridge;
 }

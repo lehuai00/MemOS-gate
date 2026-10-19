@@ -30,6 +30,44 @@ export interface HostLogger {
   error: (msg: string, ctx?: Record<string, unknown>) => void;
 }
 
+// ─── Runtime LLM capability (OpenClaw 2026.10+) ───────────────────────────
+
+/** Text-only request shape accepted by `api.runtime.llm.complete`. */
+export interface OpenClawRuntimeLlmCompleteParams {
+  messages: Array<{
+    role: "system" | "user" | "assistant";
+    content: string;
+  }>;
+  maxTokens?: number;
+  temperature?: number;
+  signal?: AbortSignal;
+  /** Human-readable audit label; never contains user credentials. */
+  purpose?: string;
+}
+
+export interface OpenClawRuntimeLlmCompleteResult {
+  text: string;
+  provider: string;
+  model: string;
+  responseModel?: string;
+  usage: {
+    inputTokens?: number;
+    outputTokens?: number;
+    totalTokens?: number;
+    costUsd?: number;
+  };
+}
+
+export interface OpenClawRuntimeLlm {
+  complete(
+    params: OpenClawRuntimeLlmCompleteParams,
+  ): Promise<OpenClawRuntimeLlmCompleteResult>;
+}
+
+export interface OpenClawPluginRuntime {
+  llm: OpenClawRuntimeLlm;
+}
+
 // ─── Agent tool shape (subset of @mariozechner/pi-agent-core AnyAgentTool) ─
 //
 // OpenClaw forwards `registerTool` to the pi-agent-core runner. The real
@@ -339,6 +377,8 @@ export interface OpenClawPluginApi {
   description?: string;
   /** Plugin-scoped config (from `config.yaml` if present). */
   pluginConfig?: Record<string, unknown>;
+  /** Runtime-owned, credential-safe LLM capability (introduced in 2026.10). */
+  runtime?: OpenClawPluginRuntime;
   logger: HostLogger;
 
   registerTool(
